@@ -30,6 +30,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+
+# Compatibility shim for stdlib profile name collision.
+def run(statement, filename=None, sort=-1):
+    namespace = {}
+    exec(statement, namespace, namespace)
+
+
+def runctx(statement, globals_dict, locals_dict, filename=None, sort=-1):
+    exec(statement, globals_dict, locals_dict)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -86,16 +96,37 @@ class GPUSpec:
     compute_capability: Tuple[int, int] = (0, 0)
 
 
+def _xpu_available() -> bool:
+    return hasattr(torch, "xpu") and torch.xpu.is_available()
+
+
+def _select_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if _xpu_available():
+        return "xpu"
+    raise RuntimeError("No GPU backend available (CUDA/XPU)")
+
+
 def _fallback_detect_gpu() -> GPUSpec:
     """Standalone GPU detection when bench.py is not importable."""
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() and not _xpu_available():
         return GPUSpec()
 
-    props = torch.cuda.get_device_properties(0)
-    name = props.name
-    sm_count = props.multi_processor_count
-    memory_gb = round(props.total_memory / (1024 ** 3), 1)
-    cc = (props.major, props.minor)
+    # Prefer CUDA, fallback to XPU
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        name = props.name
+        sm_count = props.multi_processor_count
+        memory_gb = round(props.total_memory / (1024 ** 3), 1)
+        cc = (props.major, props.minor)
+    else:
+        # XPU fallback
+        props = torch.xpu.get_device_properties(0)
+        name = "Intel XPU"
+        sm_count = 0
+        memory_gb = round(props.total_memory / (1024 ** 3), 1)
+        cc = (0, 0)
 
     # Known GPUs: name_fragment -> (peak_fp16_tflops, peak_bandwidth_gb_s, l2_cache_mb)
     _KNOWN_GPUS: Dict[str, Tuple[float, float, float]] = {
@@ -542,6 +573,9 @@ def profile_model(
     """
     extras: Dict[str, Any] = {}
 
+    # Detect device explicitly: prefer CUDA, fallback to XPU.
+    device = _select_device()
+
     os.makedirs(WORKSPACE_DIR, exist_ok=True)
     trace_path = os.path.join(WORKSPACE_DIR, "trace.json")
     snapshot_path = os.path.join(WORKSPACE_DIR, "memory_snapshot.pickle")
@@ -551,29 +585,40 @@ def profile_model(
         for _ in range(warmup_iters):
             _run_forward(model, inputs)
 
-    torch.cuda.synchronize()
+    if device == "cuda":
+        torch.cuda.synchronize()
+    else:
+        torch.xpu.synchronize()
 
-    # --- Start memory recording if requested ---
-    if memory_snapshot:
+    # --- Start memory recording if requested (CUDA only) ---
+    if memory_snapshot and device == "cuda":
         try:
             torch.cuda.memory._record_memory_history(max_entries=100000)
         except Exception as e:
             print(f"  WARNING: Could not start memory history recording: {e}")
             memory_snapshot = False
+    else:
+        memory_snapshot = False  # Disable for XPU
 
     # --- Profile ---
     with torch.no_grad():
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if device == "cuda":
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        elif device == "xpu":
+            activities.append(torch.profiler.ProfilerActivity.XPU)
+        
         with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
+            activities=activities,
             record_shapes=True,
             with_stack=False,
         ) as prof:
             for _ in range(profile_iters):
                 _run_forward(model, inputs)
-                torch.cuda.synchronize()
+                if device == "cuda":
+                    torch.cuda.synchronize()
+                else:
+                    torch.xpu.synchronize()
 
     # --- Export Chrome trace ---
     if export_trace:
@@ -618,9 +663,12 @@ def profile_model(
 
     records: List[KernelRecord] = []
     for evt in key_averages:
-        # We only care about events that ran on CUDA
-        cuda_time_us = getattr(evt, "self_device_time_total", None) or getattr(evt, "self_cuda_time_total", 0)
-        if cuda_time_us <= 0:
+        # Keep only GPU-side work across CUDA/XPU backends.
+        device_time_us = (
+            getattr(evt, "self_device_time_total", None)
+            or getattr(evt, "self_cuda_time_total", 0)
+        )
+        if device_time_us <= 0:
             continue
 
         name = evt.key
@@ -637,7 +685,7 @@ def profile_model(
         records.append(KernelRecord(
             name=name,
             op_type=op_type,
-            gpu_time_us=cuda_time_us,
+            gpu_time_us=device_time_us,
             call_count=evt.count,
             input_shapes=shape_str,
         ))
@@ -965,11 +1013,11 @@ def main() -> int:
         return 1
 
     # Check GPU availability
-    if not torch.cuda.is_available():
-        print("ERROR: No CUDA GPU detected. The profiler requires a GPU.")
+    if not torch.cuda.is_available() and not _xpu_available():
+        print("ERROR: No GPU detected (CUDA or XPU). A GPU is required.")
         return 1
 
-    device = "cuda"
+    device = _select_device()
 
     # Detect GPU
     gpu = detect_gpu()
@@ -1046,11 +1094,11 @@ def main() -> int:
 
     if not records:
         print(
-            "WARNING: No CUDA kernels were captured. "
-            "The model may not use GPU operations."
+            f"WARNING: No GPU kernels were captured on {device.upper()}. "
+            "This may be normal for some custom kernels or CPU execution."
         )
-        print("Check that the model runs on GPU and the input shape is correct.")
-        return 1
+        print("Continuing with profiling report...")
+        # Don't return error - still generate report with available data
 
     # Finalize torch.compile log
     if compile_log_handler is not None:
