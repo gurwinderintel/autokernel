@@ -1,4 +1,14 @@
-"""One-time setup and baseline benchmarking for AutoKernel."""
+"""
+AutoKernel -- One-time setup and baseline benchmarking.
+
+Verifies environment (CUDA, Triton, PyTorch), generates deterministic test data,
+runs a smoke test on the current kernel, and benchmarks PyTorch reference
+implementations so that future experiments have a cached baseline to compare
+against.
+
+Usage:
+    uv run prepare.py
+"""
 
 import json
 import os
