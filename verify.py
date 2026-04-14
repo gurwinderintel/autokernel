@@ -725,7 +725,6 @@ class OptimizedModelContext:
         F.softmax = patched_softmax
         torch.softmax = patched_softmax
         return 1
-        return count
 
     @property
     def applied_summary(self) -> List[str]:
