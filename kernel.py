@@ -1,20 +1,40 @@
 """
-AutoKernel -- The file the agent modifies.
+AutoKernel -- Extracted kernel from model profiling.
+Op type: reduce
+Rank: 18 (1.1% of GPU time)
+Model shape: M=4096, N=4096
 
-Current kernel: Matrix Multiplication
-Target metric: throughput_tflops (higher is better)
-Secondary: correctness must ALWAYS pass
-
-The agent can change anything in this file:
-  - Block sizes, warps, stages
-  - Tiling strategy, memory access patterns
-  - Split-K, persistent kernels, autotune configs
-  - Any Triton feature or trick
-
-The agent CANNOT change bench.py, reference.py, or the evaluation.
+This kernel was extracted from profiling transformers.
+The agent optimizes this to maximize throughput at the model-specific shapes.
 """
 
-KERNEL_TYPE = "matmul"  # must match a key in bench.py KERNEL_CONFIGS
+KERNEL_TYPE = "reduce"
+
+# Model-specific shapes (the shapes that matter for THIS model)
+MODEL_SHAPES = {'M': 4096, 'N': 4096}
+
+# Benchmark config (self-describing -- bench.py can load this dynamically)
+TEST_SIZES = [
+    ("model_primary", {'M': 4096, 'N': 4096}),
+    # Also test nearby sizes for robustness
+    ("model_half", {'M': 2048, 'N': 2048}),
+    ("model_double", {'M': 8192, 'N': 8192}),
+]
+
+TOLERANCES = {'float16': {'atol': 0.01, 'rtol': 0.01}, 'bfloat16': {'atol': 0.1, 'rtol': 0.05}}
+
+
+def FLOPS_FN(s):
+    return s["M"] * s["N"]
+
+
+def BYTES_FN(s, dt_bytes):
+    return (s["M"] * s["N"] + s["M"]) * dt_bytes
+
+
+# ======================================================================
+# Triton kernel code (from kernels/reduce.py)
+# ======================================================================
 
 import torch
 import triton
@@ -22,66 +42,125 @@ import triton.language as tl
 
 
 @triton.jit
-def matmul_kernel(
-    A_ptr, B_ptr, C_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
+def reduce_sum_kernel(
+    X_ptr,
+    OUT_ptr,
+    reduce_size,
+    stride_x_row,
+    stride_x_col,
+    BLOCK_SIZE: tl.constexpr,
 ):
-    """Basic tiled matmul. The agent improves this."""
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    """
+    Parallel sum reduction. One program per output element.
+    Reduces over `reduce_size` elements with stride `stride_x_col`.
+    """
+    row_idx = tl.program_id(0)
 
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    # Base pointer for this row
+    row_start = X_ptr + row_idx * stride_x_row
 
-    a_ptrs = A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = B_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    # Accumulate in float32 for stability
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
 
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for offset in range(0, reduce_size, BLOCK_SIZE):
+        col_offsets = offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_offsets < reduce_size
+        x = tl.load(row_start + col_offsets * stride_x_col, mask=mask, other=0.0).to(tl.float32)
+        acc += x
 
-    for k in range(0, K, BLOCK_SIZE_K):
-        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
-        b = tl.load(b_ptrs, mask=(offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
-        acc += tl.dot(a, b)
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-        offs_k += BLOCK_SIZE_K
-
-    c = acc.to(C_ptr.dtype.element_ty)
-    c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, c, mask=mask)
+    result = tl.sum(acc, axis=0)
+    tl.store(OUT_ptr + row_idx, result)
 
 
-def kernel_fn(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    """Entry point called by bench.py. Must match reference.matmul_ref signature."""
-    assert A.device.type in ("cuda", "xpu") and B.device.type in ("cuda", "xpu")
-    M, K = A.shape
-    K2, N = B.shape
-    assert K == K2
+def kernel_fn(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """
+    Entry point called by bench.py. Must match reference.reduce_sum_ref signature.
 
-    C = torch.empty((M, N), device=A.device, dtype=A.dtype)
+    Args:
+        x: Input tensor of any shape
+        dim: Dimension to reduce over (default: -1, last dim)
 
-    BLOCK_SIZE_M = 64
-    BLOCK_SIZE_N = 64
-    BLOCK_SIZE_K = 32
+    Returns:
+        Tensor with the specified dimension reduced (summed).
+    """
+    assert x.device.type in ("cuda", "xpu")
 
-    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+    # Normalize dim
+    if dim < 0:
+        dim = x.ndim + dim
+    assert 0 <= dim < x.ndim, f"dim {dim} out of range for tensor with {x.ndim} dims"
 
-    matmul_kernel[grid](
-        A, B, C,
-        M, N, K,
-        A.stride(0), A.stride(1),
-        B.stride(0), B.stride(1),
-        C.stride(0), C.stride(1),
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-    )
-    return C
+    # Compute shapes
+    # We want to reshape to [outer, reduce_size, inner] then reduce the middle dim
+    outer_size = 1
+    for i in range(dim):
+        outer_size *= x.size(i)
+
+    reduce_size = x.size(dim)
+
+    inner_size = 1
+    for i in range(dim + 1, x.ndim):
+        inner_size *= x.size(i)
+
+    # Make contiguous and reshape
+    x_contig = x.contiguous()
+
+    # Output shape: same as input but with dim removed
+    out_shape = list(x.shape)
+    out_shape.pop(dim)
+    if len(out_shape) == 0:
+        out_shape = [1]
+
+    # Total number of output elements
+    n_output = outer_size * inner_size
+
+    # For the simple case where we reduce over the last dimension
+    # and inner_size == 1, we can use a straightforward approach
+    if inner_size == 1:
+        x_2d = x_contig.view(outer_size, reduce_size)
+        out_flat = torch.empty(n_output, device=x.device, dtype=torch.float32)
+
+        BLOCK_SIZE = triton.next_power_of_2(min(reduce_size, 8192))
+
+        grid = (n_output,)
+        reduce_sum_kernel[grid](
+            x_2d,
+            out_flat,
+            reduce_size,
+            x_2d.stride(0),
+            x_2d.stride(1),
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=8,
+        )
+
+        return out_flat.to(x.dtype).view(out_shape)
+    else:
+        # General case: transpose so reduce dim is last, then reduce
+        # Move reduce dim to last position
+        perm = list(range(x.ndim))
+        perm.pop(dim)
+        perm.append(dim)
+        x_transposed = x.permute(*perm).contiguous()
+
+        # Now reduce over last dim
+        total_rows = outer_size * inner_size
+        x_2d = x_transposed.view(total_rows, reduce_size)
+        out_flat = torch.empty(total_rows, device=x.device, dtype=torch.float32)
+
+        BLOCK_SIZE = triton.next_power_of_2(min(reduce_size, 8192))
+
+        grid = (total_rows,)
+        reduce_sum_kernel[grid](
+            x_2d,
+            out_flat,
+            reduce_size,
+            x_2d.stride(0),
+            x_2d.stride(1),
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=8,
+        )
+
+        # After permutation, the output follows permuted dim order (without the
+        # reduce dim). Build the correct shape from the permuted order.
+        permuted_out_shape = [x.shape[d] for d in perm[:-1]]
+        return out_flat.to(x.dtype).view(permuted_out_shape)
